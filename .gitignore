@@ -4,6 +4,10 @@ checkpoints/
 data/
 wandb/
 
+# Local Franka + RealSense previews.
+franka_realsense_*views.jpg
+franka_realsense_policy_inputs.jpg
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

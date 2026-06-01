@@ -1,0 +1,54 @@
+  source ~/venvs/openpi-franka/bin/activate
+ 
+ 服务端监听
+   uv run scripts/serve_policy.py --env DROID --port 8000
+
+ 
+
+
+
+step on client 
+  python examples/franka_realsense/main.py \
+    --policy-host 172.16.0.7 \
+    --policy-port 8000 \
+    --robot-ip 172.16.0.8 \
+    --external-camera-serial 215322076954 \
+    --wrist-camera-serial 233622071841 \
+    --prompt "pick up the object" \
+    --camera-warmup-frames 90 \
+    --white-balance 4500 \
+    --execute \
+    --yes \
+    --step-on-space
+
+
+
+client
+    python examples/franka_realsense/main.py \
+    --policy-host 172.16.0.7 \
+    --policy-port 8000   --franky-dynamics-factor 0.3 \
+    --robot-ip 172.16.0.8 \
+    --external-camera-serial 215322076954 \
+    --wrist-camera-serial 233622071841 \
+    --prompt "pick up the object" \
+    --camera-warmup-frames 90 \
+    --white-balance 4500 \
+    --execute \
+    --yes
+
+
+
+菜数据
+
+
+  uv run python examples/franka_realsense/record_teleop_lerobot.py \
+      --repo-id mani1/franka_realsense_droid_video \
+      --dataset-root ~/franka_realsense_lerobot/mani1/franka_realsense_droid_video \
+      --robot-ip 172.16.0.8 \
+      --external-camera-serial 215322076954 \
+      --wrist-camera-serial 233622071841 \
+      --task "pick up all the object and put into the green" \
+      --append \
+      --velocity-duration-ms 70 \
+      --use-videos
+

@@ -916,6 +916,30 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
+    TrainConfig(
+        # Full-parameter fine-tuning on the local Franka + RealSense video dataset collected by
+        # examples/franka_realsense/record_teleop_lerobot.py. The data follows the custom DROID
+        # LeRobot schema and stores joint velocity actions at 15 Hz.
+        name="pi05_franka_realsense_video_full_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="mani1/franka_realsense_droid_video",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        keep_period=5000,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
