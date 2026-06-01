@@ -394,3 +394,66 @@ python examples/franka_realsense/main.py --list-cameras
 ```bash
 --policy-image-preprocess direct
 ```
+
+ 在服务器上进入你 clone 下来的仓库根目录后，通常这样配置 uv 环境：
+
+  cd openpi-xbox-teleop
+  uv sync
+
+  如果服务器还没有安装 uv，先装：
+
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+
+  然后重新加载 shell：
+
+  source ~/.bashrc
+
+  或者如果你用的是 zsh：
+
+  source ~/.zshrc
+
+  确认 uv 可用：
+
+  uv --version
+
+  再回到仓库里同步环境：
+
+  cd openpi-xbox-teleop
+  uv sync
+
+  如果要在服务器上跑 DROID/full training 相关依赖，OpenPI 官方有些命令会用额外 dependency group。你当前这个 LeRobot video 数据微调命令一
+  般先用普通环境即可：
+
+  uv run python -c "from openpi.training import config; c=config.get_config('pi05_franka_realsense_video_full_finetune'); print(c.name,
+  c.data.repo_id)"
+
+  如果这条能输出：
+
+  pi05_franka_realsense_video_full_finetune mani1/franka_realsense_droid_video
+
+  说明环境和配置基本能加载。
+
+  然后服务器训练命令是：
+
+  XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py \
+    pi05_franka_realsense_video_full_finetune \
+    --exp-name franka_realsense_droid_video_v1 \
+    --overwrite
+
+  如果服务器没有 GPU 版 JAX，训练时可能会报 CUDA/JAX 相关错误。那时再按服务器 CUDA 版本安装对应 JAX，例如 CUDA 12 常见是：
+
+  uv pip install -U "jax[cuda12]"
+
+  更稳妥的顺序是：
+
+  cd openpi-xbox-teleop
+
+  uv sync
+
+  uv run python -c "import jax; print(jax.devices())"
+
+  如果输出里能看到 GPU，例如：
+
+  [CudaDevice(id=0)]
+
+  就可以开始训练。
