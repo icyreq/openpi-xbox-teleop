@@ -65,6 +65,8 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional local LeRobot dataset root. If set, the loader reads this directory instead of HF cache.
+    repo_root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -430,6 +432,10 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
     To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
     """
 
+    # If true, actions are absolute joint targets and the joint dimensions are converted
+    # to deltas relative to the current state before model normalization/training.
+    use_delta_joint_actions: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -447,11 +453,18 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
                 )
             ]
         )
-        # We assume joint *velocity* actions, so we should *not* apply an additional delta transform.
+        # Map the DROID-style LeRobot fields to the common policy input schema.
         data_transforms = _transforms.Group(
             inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
             outputs=[droid_policy.DroidOutputs()],
         )
+        if self.use_delta_joint_actions:
+            # Convert absolute joint targets to deltas for the model, while keeping the gripper absolute.
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
         model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
@@ -935,6 +948,30 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        keep_period=5000,
+    ),
+    TrainConfig(
+        # Full-parameter fine-tuning on the Franka + RealSense dataset after converting actions
+        # from recorded joint velocities to next-step absolute joint targets.
+        name="pi05_franka_realsense_video_joint_full_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="mani1/franka_realsense_droid_video_joint_action",
+            base_config=DataConfig(
+                repo_root="/home/nvidia/lixu_thor/franka_realsense_droid_video_joint_action",
+                prompt_from_task=True,
+            ),
+            use_delta_joint_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/nvidia/zouyi/vla/openpi_docker_env/pytorch_checkpoints/pi05_base",
         num_train_steps=20_000,
         batch_size=32,
         save_interval=1000,

@@ -215,9 +215,16 @@ videos/chunk-000/...
 在服务器仓库根目录运行：
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py \
+cd ~/lixu_thor/openpi-xbox-teleop
+
+PYTHONPATH=$PWD/src:$PWD:$PYTHONPATH \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+/home/nvidia/lixu_thor/openpi_bak/.venv/bin/python \
+  scripts/train_pytorch.py \
   pi05_franka_realsense_video_full_finetune \
-  --exp-name franka_realsense_droid_video_v1 \
+  --exp_name franka_realsense_droid_video_debug_3000 \
+  --num_train_steps 3003 \
+  --save_interval 500 \
   --overwrite
 ```
 
