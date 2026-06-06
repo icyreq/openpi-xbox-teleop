@@ -15,3 +15,13 @@ uv run python examples/franka_realsense/record_teleop_lerobot.py \
 /home/nvidia/lixu_thor/franka_realsense_droid_video
 
 
+启动训练
+  PYTHONPATH=$PWD/src:$PWD:$PYTHONPATH \
+  /home/nvidia/lixu_thor/openpi_bak/.venv/bin/python \
+    scripts/train_pytorch.py \
+    pi05_franka_realsense_video_joint_full_finetune \
+    --exp_name franka_realsense_joint_action_from_pi05_base_v1 \
+    --num_train_steps 3003 \
+    --save_interval 1000 \
+    --overwrite
+
