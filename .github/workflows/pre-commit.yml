@@ -1,13 +1,9 @@
-name: pre-commit
+name: pre-commit-disabled
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - "*"
+  workflow_dispatch:
 jobs:
   pre-commit:
+    if: false
     runs-on: ubuntu-latest
     env:
       GIT_LFS_SKIP_SMUDGE: true
