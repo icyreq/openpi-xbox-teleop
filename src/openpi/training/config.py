@@ -977,6 +977,29 @@ _CONFIGS = [
         save_interval=1000,
         keep_period=5000,
     ),
+    TrainConfig(
+        # Full-parameter fine-tuning on the Franka + RealSense dataset converted to the DROID action
+        # convention: actions[:7] are normalized one-step joint deltas and action[7] is gripper position.
+        name="pi05_franka_realsense_droid_action_full_align_full_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=15,
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="mani1/franka_realsense_droid_video_droid_action",
+            base_config=DataConfig(
+                repo_root="/home/nvidia/lixu_thor/franka_realsense_droid_video_droid_action",
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        pytorch_weight_path="/home/nvidia/lixu_thor/openpi-xbox-teleop/openpi_checkpoints/pi05_droid_pytorch",
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        keep_period=5000,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
