@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import math
 import pathlib
 import queue
@@ -26,6 +27,7 @@ DROID_CONTROL_HZ = 15
 DROID_IMAGE_WIDTH = 320
 DROID_IMAGE_HEIGHT = 180
 DEFAULT_DATASET_ROOT = pathlib.Path.home() / "franka_realsense_lerobot" / "mani1" / "franka_realsense_droid"
+DELETE_CONFIRM_WINDOW_S = 3.0
 
 JS_EVENT_BUTTON = 0x01
 JS_EVENT_AXIS = 0x02
@@ -390,6 +392,7 @@ class XboxTeleopRuntime:
         self._recording_lock = threading.Lock()
         self._prev_buttons = [0] * 12
         self._estop = False
+        self._delete_last_requested_at = 0.0
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -475,8 +478,13 @@ class XboxTeleopRuntime:
             if self.is_recording():
                 self._push_event("discard_episode")
             else:
-                q, dq = self._controller.state_sample()
-                print(f"当前关节位置 q={np.round(q, 3)} 当前关节速度 dq={np.round(dq, 3)}")
+                now = time.monotonic()
+                if now - self._delete_last_requested_at <= DELETE_CONFIRM_WINDOW_S:
+                    self._delete_last_requested_at = 0.0
+                    self._push_event("delete_last_episode")
+                else:
+                    self._delete_last_requested_at = now
+                    print(f"再次按 X 将删除上一条已保存 episode。{DELETE_CONFIRM_WINDOW_S:.0f} 秒内有效。")
 
         if rising(XboxIndex.B):
             self._estop = not self._estop
@@ -731,6 +739,86 @@ def has_saved_episode_files(root: pathlib.Path) -> bool:
     return (data_dir.is_dir() and any(data_dir.rglob("*.parquet"))) or (
         videos_dir.is_dir() and any(videos_dir.rglob("*.mp4"))
     )
+
+
+def load_json(path: pathlib.Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path: pathlib.Path, data: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+
+def load_jsonl(path: pathlib.Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def write_jsonl(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def delete_last_saved_episode(dataset: LeRobotDataset) -> tuple[int, int]:
+    root = pathlib.Path(dataset.root)
+    info_path = root / "meta" / "info.json"
+    episodes_path = root / "meta" / "episodes.jsonl"
+    stats_path = root / "meta" / "episodes_stats.jsonl"
+
+    # 删除只允许作用在最后一个连续 episode，避免破坏 LeRobot 的全局帧索引和文件命名约定。
+    info = load_json(info_path)
+    episodes = load_jsonl(episodes_path)
+    episode_stats = load_jsonl(stats_path)
+    total_episodes = int(info["total_episodes"])
+    if total_episodes <= 0 or not episodes:
+        print("当前数据集没有可删除的已保存 episode。")
+        return -1, 0
+
+    last_episode = episodes[-1]
+    last_index = int(last_episode["episode_index"])
+    if last_index != total_episodes - 1:
+        raise RuntimeError(
+            f"最后一条 episode_index={last_index}, 但 total_episodes={total_episodes}。"
+            "为避免破坏数据集索引，已拒绝删除。"
+        )
+    last_length = int(last_episode["length"])
+
+    data_path = root / dataset.meta.get_data_file_path(last_index)
+    data_path.unlink(missing_ok=True)
+    for video_key in dataset.meta.video_keys:
+        video_path = root / dataset.meta.get_video_file_path(last_index, video_key)
+        video_path.unlink(missing_ok=True)
+
+    episodes = episodes[:-1]
+    episode_stats = [row for row in episode_stats if int(row["episode_index"]) != last_index]
+    info["total_episodes"] = total_episodes - 1
+    info["total_frames"] = max(0, int(info["total_frames"]) - last_length)
+    info["total_videos"] = max(0, int(info.get("total_videos", 0)) - len(dataset.meta.video_keys))
+    info["total_chunks"] = max(1, (info["total_episodes"] + int(info["chunks_size"]) - 1) // int(info["chunks_size"]))
+    info["splits"] = {"train": f"0:{info['total_episodes']}"}
+
+    write_json(info_path, info)
+    write_jsonl(episodes_path, episodes)
+    write_jsonl(stats_path, episode_stats)
+
+    return last_index, last_length
+
+
+def refresh_dataset_metadata(dataset: LeRobotDataset) -> None:
+    root = pathlib.Path(dataset.root)
+    info = load_json(root / "meta" / "info.json")
+    episodes = {int(row["episode_index"]): row for row in load_jsonl(root / "meta" / "episodes.jsonl")}
+    episode_stats = {int(row["episode_index"]): row["stats"] for row in load_jsonl(root / "meta" / "episodes_stats.jsonl")}
+
+    # 同步内存中的 meta，保证删除后继续保存新 episode 时索引和全局帧数接着磁盘状态走。
+    dataset.meta.info = info
+    dataset.meta.episodes = episodes
+    dataset.meta.episodes_stats = episode_stats
+    dataset.meta.stats = {}
+    dataset.episode_buffer = dataset.create_episode_buffer()
 
 
 def validate_dataset_storage_mode(dataset: LeRobotDataset, args: Args) -> None:
@@ -1016,6 +1104,14 @@ def main(args: Args) -> None:
         if runtime is not None:
             runtime.set_recording(value=False)
 
+    def reload_dataset_after_delete(new_dataset: LeRobotDataset) -> None:
+        nonlocal dataset
+        with contextlib.suppress(Exception):
+            dataset.stop_image_writer()
+        dataset = new_dataset
+        if args.image_writer_processes or args.image_writer_threads:
+            dataset.start_image_writer(args.image_writer_processes, args.image_writer_threads)
+
     try:
         joystick.start()
         controller = FrankaTeleopController(args)
@@ -1082,6 +1178,21 @@ def main(args: Args) -> None:
                         print(f"开始录制当前 episode。任务: {args.task!r}")
                 elif event == "discard_episode" and recording:
                     finish_episode(discard=True)
+                elif event == "delete_last_episode" and not recording:
+                    previous_total_episodes = dataset.meta.total_episodes
+                    deleted_index, deleted_frames = delete_last_saved_episode(dataset)
+                    remaining_episodes = max(0, previous_total_episodes - 1)
+                    if deleted_index >= 0 and remaining_episodes > 0:
+                        new_dataset = LeRobotDataset(args.repo_id, root=dataset.root)
+                        new_dataset.episode_buffer = new_dataset.create_episode_buffer()
+                        reload_dataset_after_delete(new_dataset)
+                    else:
+                        refresh_dataset_metadata(dataset)
+                    if deleted_index >= 0:
+                        print(
+                            f"已删除上一条 episode: index={deleted_index}, frames={deleted_frames}, "
+                            f"当前总数={remaining_episodes}"
+                        )
 
             if recording and args.max_episode_seconds is not None and now - episode_started_at >= args.max_episode_seconds:
                 finish_episode(discard=False)
