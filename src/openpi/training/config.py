@@ -978,8 +978,8 @@ _CONFIGS = [
         keep_period=5000,
     ),
     TrainConfig(
-        # Full-parameter fine-tuning on the Franka + RealSense dataset converted to the DROID action
-        # convention: actions[:7] are normalized one-step joint deltas and action[7] is gripper position.
+        # Full-parameter fine-tuning on the new Franka + RealSense dataset converted to the DROID
+        # action convention: actions[:7] are normalized one-step joint deltas and action[7] is gripper position.
         name="pi05_franka_realsense_droid_action_full_align_full_finetune",
         model=pi0_config.Pi0Config(
             pi05=True,
@@ -989,7 +989,7 @@ _CONFIGS = [
         data=LeRobotDROIDDataConfig(
             repo_id="mani1/AAA_franka_data_droid_action",
             base_config=DataConfig(
-                repo_root="/home/nvidia/lixu_thor/franka_realsense_droid_video_droid_action",
+                repo_root="/home/nvidia/lixu_thor/AAA_franka_data_droid_action",
                 prompt_from_task=True,
             ),
         ),

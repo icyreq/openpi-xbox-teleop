@@ -15,14 +15,14 @@ uv run python examples/franka_realsense/record_teleop_lerobot.py \
 /home/nvidia/lixu_thor/franka_realsense_droid_video
 
 
-启动训练
-  PYTHONPATH=$PWD/src:$PWD:$PYTHONPATH \
+启动训练(服务器可以使用，推理侧电脑无训练环境)
+     PYTHONPATH=$PWD/src:$PWD:$PYTHONPATH \
   /home/nvidia/lixu_thor/openpi_bak/.venv/bin/python \
     scripts/train_pytorch.py \
     pi05_franka_realsense_droid_action_full_align_full_finetune \
-    --exp_name franka_realsense_droid_action_from_pi05_droid_v1 \
-    --num_train_steps 3003 \
-    --save_interval 1000 \
+    --exp_name AAA_franka_droid_action_new_data \
+    --num_train_steps 1600 \
+    --save_interval 1600 \
     --overwrite
 推理代码：
 
