@@ -987,7 +987,7 @@ _CONFIGS = [
             action_horizon=15,
         ),
         data=LeRobotDROIDDataConfig(
-            repo_id="mani1/franka_realsense_droid_video_droid_action",
+            repo_id="mani1/AAA_franka_data_droid_action",
             base_config=DataConfig(
                 repo_root="/home/nvidia/lixu_thor/franka_realsense_droid_video_droid_action",
                 prompt_from_task=True,

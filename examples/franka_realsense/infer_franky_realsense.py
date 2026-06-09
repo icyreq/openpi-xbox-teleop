@@ -1,4 +1,4 @@
-"""Run a pi05 Franka RealSense policy on a Franka robot through franky.
+"""Run a remote pi05 Franka RealSense policy on a Franka robot through franky.
 
 The policy was trained with DROID-style actions:
     action[:7] = (q[t + 1] - q[t]) / 0.2
@@ -12,18 +12,16 @@ same one-step joint target used by the DROID control stack:
 from __future__ import annotations
 
 import argparse
-import pathlib
 import time
 
+import cv2
 from franky import Gripper
 from franky import JointMotion
 from franky import Robot
 import numpy as np
+from openpi_client import websocket_client_policy
 from PIL import Image
 import pyrealsense2 as rs
-
-from openpi.policies import policy_config
-from openpi.training import config as training_config
 
 
 DROID_CONTROL_HZ = 15.0
@@ -62,6 +60,16 @@ def resize_for_droid(image: np.ndarray) -> np.ndarray:
     return np.asarray(Image.fromarray(image).resize((DROID_IMAGE_WIDTH, DROID_IMAGE_HEIGHT), resampling), dtype=np.uint8)
 
 
+def show_camera_preview(*, window_name: str, external_image: np.ndarray, wrist_image: np.ndarray) -> bool:
+    """Display the current RGB camera pair. Returns True when the user presses q."""
+    if external_image.shape != wrist_image.shape:
+        raise ValueError(f"Camera image shapes differ: external={external_image.shape}, wrist={wrist_image.shape}.")
+    preview_rgb = np.concatenate([external_image, wrist_image], axis=1)
+    preview_bgr = cv2.cvtColor(preview_rgb, cv2.COLOR_RGB2BGR)
+    cv2.imshow(window_name, preview_bgr)
+    return (cv2.waitKey(1) & 0xFF) == ord("q")
+
+
 def gripper_width_to_droid_position(width: float, *, open_width: float, closed_width: float) -> np.ndarray:
     """Convert franky gripper width to the DROID convention used in training."""
     span = open_width - closed_width
@@ -73,8 +81,8 @@ def make_observation(
     *,
     robot: Robot,
     gripper: Gripper | None,
-    external_camera: RealSenseCamera,
-    wrist_camera: RealSenseCamera,
+    external_image: np.ndarray,
+    wrist_image: np.ndarray,
     prompt: str,
     gripper_open_width: float,
     gripper_closed_width: float,
@@ -91,8 +99,8 @@ def make_observation(
         )
 
     return {
-        "observation/exterior_image_1_left": resize_for_droid(external_camera.read_rgb()),
-        "observation/wrist_image_left": resize_for_droid(wrist_camera.read_rgb()),
+        "observation/exterior_image_1_left": resize_for_droid(external_image),
+        "observation/wrist_image_left": resize_for_droid(wrist_image),
         "observation/joint_position": joint_position,
         "observation/gripper_position": gripper_position,
         "prompt": prompt,
@@ -129,16 +137,16 @@ def execute_action(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--policy-host", default="127.0.0.1")
+    parser.add_argument("--policy-port", type=int, default=8000)
+
     parser.add_argument("--robot-ip", default="172.16.0.8")
     parser.add_argument("--external-camera-serial", required=True)
     parser.add_argument("--wrist-camera-serial", required=True)
 
-    parser.add_argument("--config-name", default="pi05_franka_realsense_droid_action_full_align_full_finetune")
-    parser.add_argument("--checkpoint-dir", type=pathlib.Path, required=True)
     parser.add_argument("--prompt", required=True)
-    parser.add_argument("--pytorch-device", default=None)
 
-    parser.add_argument("--max-timesteps", type=int, default=600)
+    parser.add_argument("--max-timesteps", type=int, default=999999999)
     parser.add_argument("--open-loop-horizon", type=int, default=8)
     parser.add_argument("--control-hz", type=float, default=DROID_CONTROL_HZ)
 
@@ -146,6 +154,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--camera-warmup-frames", type=int, default=90)
+    parser.add_argument("--disable-preview", action="store_true")
+    parser.add_argument("--preview-window-name", default="Franka RealSense inference")
 
     parser.add_argument("--relative-dynamics-factor", type=float, default=0.1)
     parser.add_argument("--disable-gripper", action="store_true")
@@ -159,15 +169,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Load the same OpenPI training config and checkpoint assets used during fine-tuning.
-    train_cfg = training_config.get_config(args.config_name)
-    policy = policy_config.create_trained_policy(
-        train_cfg,
-        args.checkpoint_dir,
-        pytorch_device=args.pytorch_device,
+    policy = websocket_client_policy.WebsocketClientPolicy(
+        host=args.policy_host,
+        port=args.policy_port,
     )
+    print(f"Connected to policy server: {policy.get_server_metadata()}")
 
-    # Create hardware handles only after the policy is ready.
+    # Create hardware handles only after the remote policy server is reachable.
     robot = Robot(args.robot_ip)
     robot.relative_dynamics_factor = args.relative_dynamics_factor
     gripper = None if args.disable_gripper else Gripper(args.robot_ip)
@@ -191,17 +199,29 @@ def main() -> None:
     last_gripper_target = None
     control_period = 1.0 / args.control_hz
 
+    if not args.disable_preview:
+        cv2.namedWindow(args.preview_window_name, cv2.WINDOW_NORMAL)
+
     try:
         for _ in range(args.max_timesteps):
             step_start = time.monotonic()
+            external_image = external_camera.read_rgb()
+            wrist_image = wrist_camera.read_rgb()
+
+            if not args.disable_preview and show_camera_preview(
+                window_name=args.preview_window_name,
+                external_image=external_image,
+                wrist_image=wrist_image,
+            ):
+                break
 
             # Query a new action chunk, then execute a short open-loop prefix at 15 Hz.
             if action_chunk is None or chunk_index >= min(args.open_loop_horizon, len(action_chunk)):
                 obs = make_observation(
                     robot=robot,
                     gripper=gripper,
-                    external_camera=external_camera,
-                    wrist_camera=wrist_camera,
+                    external_image=external_image,
+                    wrist_image=wrist_image,
                     prompt=args.prompt,
                     gripper_open_width=args.gripper_open_width,
                     gripper_closed_width=args.gripper_closed_width,
@@ -224,6 +244,8 @@ def main() -> None:
             if elapsed < control_period:
                 time.sleep(control_period - elapsed)
     finally:
+        if not args.disable_preview:
+            cv2.destroyWindow(args.preview_window_name)
         external_camera.close()
         wrist_camera.close()
 

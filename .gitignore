@@ -176,3 +176,5 @@ cython_debug/
 *.gif
 *.webp
 openpi_checkpoints/
+*.pt
+*.safetensors

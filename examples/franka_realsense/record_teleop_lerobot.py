@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 import cv2
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.datasets.utils import load_info as load_lerobot_info
 from main import RealSenseCamera
 from main import list_realsense_cameras
 from main import save_preview
@@ -81,7 +82,7 @@ class Args:
     task: str = "pick up the object"
     append: bool = False
     overwrite: bool = False
-    max_episodes: int = 50
+    max_episodes: int = 500
     min_episode_frames: int = 10
     max_episode_seconds: float | None = None
     use_videos: bool = False
@@ -95,7 +96,7 @@ class Args:
     franky_dynamics_factor: float = 0.1
     home_dynamics_factor: float = 0.3
     initial_reset: bool = False
-    home_pose: tuple[float, float, float, float, float, float] = (0.4, 0.0, 0.5, math.pi, 0.0, 0.0)
+    home_pose: tuple[float, float, float, float, float, float] = (0.4, 0.0, 0.37, math.pi, 0.0, 0.0)
 
     # Xbox controller through Linux joystick API.
     joy_device: pathlib.Path = pathlib.Path("/dev/input/js0")
@@ -229,6 +230,13 @@ def quat_from_rpy(roll: float, pitch: float, yaw: float) -> np.ndarray:
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class RobotStateSample:
+    joint_position: np.ndarray
+    joint_velocity: np.ndarray
+    end_effector_transform: np.ndarray
+
+
 class FrankaTeleopController:
     def __init__(self, args: Args):
         import franky
@@ -250,6 +258,7 @@ class FrankaTeleopController:
         self._gripper_action = 0.0
         self._last_q = np.zeros(7, dtype=np.float32)
         self._last_dq = np.zeros(7, dtype=np.float32)
+        self._last_end_effector_transform = np.eye(4, dtype=np.float32)
         self._missed_velocity_commands = 0
         self._last_velocity_command_time = 0.0
         self._robot_command_period = 1.0 / max(float(args.robot_command_hz), 1e-6)
@@ -356,20 +365,34 @@ class FrankaTeleopController:
         closed_amount = (self._open_width - width) / span
         return np.asarray([np.clip(closed_amount, 0.0, 1.0)], dtype=np.float32)
 
-    def state_sample(self) -> tuple[np.ndarray, np.ndarray]:
+    def state_sample(self) -> RobotStateSample:
         if not self._robot_lock.acquire(blocking=False):
-            return self._last_q.copy(), self._last_dq.copy()
+            return RobotStateSample(
+                joint_position=self._last_q.copy(),
+                joint_velocity=self._last_dq.copy(),
+                end_effector_transform=self._last_end_effector_transform.copy(),
+            )
         try:
             state = self._robot.state
             q = np.asarray(state.q, dtype=np.float32).reshape(-1).copy()
             dq = np.asarray(state.dq, dtype=np.float32).reshape(-1).copy()
+            end_effector_transform = np.asarray(state.O_T_EE.matrix, dtype=np.float32).reshape(4, 4).copy()
         finally:
             self._robot_lock.release()
-        if q.size != 7 or dq.size != 7:
-            raise RuntimeError(f"Expected 7 Franka joints, got q={q.shape}, dq={dq.shape}.")
+        if q.size != 7 or dq.size != 7 or end_effector_transform.shape != (4, 4):
+            raise RuntimeError(
+                "Expected Franka state shapes "
+                f"q=(7,), dq=(7,), O_T_EE=(4, 4); got q={q.shape}, dq={dq.shape}, "
+                f"O_T_EE={end_effector_transform.shape}."
+            )
         self._last_q = q.copy()
         self._last_dq = dq.copy()
-        return q, dq
+        self._last_end_effector_transform = end_effector_transform.copy()
+        return RobotStateSample(
+            joint_position=q,
+            joint_velocity=dq,
+            end_effector_transform=end_effector_transform,
+        )
 
     def shutdown(self) -> None:
         with contextlib.suppress(Exception):
@@ -714,6 +737,11 @@ def dataset_features(*, use_videos: bool) -> dict[str, Any]:
             "shape": (1,),
             "names": ["gripper_position"],
         },
+        "end_effector_transform": {
+            "dtype": "float32",
+            "shape": (4, 4),
+            "names": ["transform_row", "transform_col"],
+        },
         "actions": {
             "dtype": "float32",
             "shape": (8,),
@@ -738,6 +766,24 @@ def has_saved_episode_files(root: pathlib.Path) -> bool:
     videos_dir = root / "videos"
     return (data_dir.is_dir() and any(data_dir.rglob("*.parquet"))) or (
         videos_dir.is_dir() and any(videos_dir.rglob("*.mp4"))
+    )
+
+
+def is_empty_lerobot_dataset_root(root: pathlib.Path) -> bool:
+    if not is_lerobot_dataset_root(root):
+        return False
+
+    meta = root / "meta"
+    info = load_lerobot_info(root)
+    episodes = load_jsonl(meta / "episodes.jsonl")
+    stats_path = meta / "episodes_stats.jsonl"
+    episode_stats = load_jsonl(stats_path) if stats_path.is_file() else []
+    return (
+        int(info["total_episodes"]) == 0
+        and int(info["total_frames"]) == 0
+        and not episodes
+        and not episode_stats
+        and not has_saved_episode_files(root)
     )
 
 
@@ -809,7 +855,7 @@ def delete_last_saved_episode(dataset: LeRobotDataset) -> tuple[int, int]:
 
 def refresh_dataset_metadata(dataset: LeRobotDataset) -> None:
     root = pathlib.Path(dataset.root)
-    info = load_json(root / "meta" / "info.json")
+    info = load_lerobot_info(root)
     episodes = {int(row["episode_index"]): row for row in load_jsonl(root / "meta" / "episodes.jsonl")}
     episode_stats = {int(row["episode_index"]): row["stats"] for row in load_jsonl(root / "meta" / "episodes_stats.jsonl")}
 
@@ -837,6 +883,28 @@ def validate_dataset_storage_mode(dataset: LeRobotDataset, args: Args) -> None:
         )
 
 
+def validate_dataset_schema(dataset: LeRobotDataset, args: Args) -> None:
+    validate_dataset_storage_mode(dataset, args)
+    expected_features = dataset_features(use_videos=args.use_videos)
+    mismatched: list[str] = []
+    for key, expected in expected_features.items():
+        actual = dataset.features.get(key)
+        if actual is None:
+            mismatched.append(f"{key}=missing")
+            continue
+        if actual.get("dtype") != expected["dtype"] or tuple(actual.get("shape", ())) != expected["shape"]:
+            mismatched.append(
+                f"{key}=dtype {actual.get('dtype')} shape {actual.get('shape')}, "
+                f"expected dtype {expected['dtype']} shape {expected['shape']}"
+            )
+    if mismatched:
+        details = "; ".join(mismatched)
+        raise RuntimeError(
+            f"已有数据集 schema 和当前采集脚本不一致: {details}。"
+            "请换一个 --dataset-root 或加 --overwrite 重建。"
+        )
+
+
 def create_or_load_dataset(args: Args) -> LeRobotDataset:
     root = dataset_root(args)
     if root.exists():
@@ -851,9 +919,12 @@ def create_or_load_dataset(args: Args) -> LeRobotDataset:
                     )
                 print(f"检测到不完整的本地数据集目录, 将重新创建: {root}")
                 shutil.rmtree(root)
+            elif is_empty_lerobot_dataset_root(root):
+                print(f"检测到空的本地 LeRobot 数据集目录, 将重新创建: {root}")
+                shutil.rmtree(root)
             else:
                 dataset = LeRobotDataset(args.repo_id, root=root)
-                validate_dataset_storage_mode(dataset, args)
+                validate_dataset_schema(dataset, args)
                 dataset.episode_buffer = dataset.create_episode_buffer()
                 if args.image_writer_processes or args.image_writer_threads:
                     dataset.start_image_writer(args.image_writer_processes, args.image_writer_threads)
@@ -873,7 +944,7 @@ def create_or_load_dataset(args: Args) -> LeRobotDataset:
     if args.append and root.exists():
         try:
             dataset = LeRobotDataset(args.repo_id, root=root)
-            validate_dataset_storage_mode(dataset, args)
+            validate_dataset_schema(dataset, args)
             dataset.episode_buffer = dataset.create_episode_buffer()
             if args.image_writer_processes or args.image_writer_threads:
                 dataset.start_image_writer(args.image_writer_processes, args.image_writer_threads)
@@ -1029,9 +1100,9 @@ def make_record_frame(
     external_image: np.ndarray,
     wrist_image: np.ndarray,
 ) -> dict[str, Any]:
-    joint_position, joint_velocity = controller.state_sample()
+    robot_state = controller.state_sample()
     clipped_joint_velocity = np.clip(
-        joint_velocity,
+        robot_state.joint_velocity,
         -float(args.max_recorded_joint_velocity),
         float(args.max_recorded_joint_velocity),
     )
@@ -1045,8 +1116,9 @@ def make_record_frame(
         "exterior_image_1_left": exterior,
         "exterior_image_2_left": exterior.copy(),
         "wrist_image_left": wrist,
-        "joint_position": joint_position.astype(np.float32),
+        "joint_position": robot_state.joint_position.astype(np.float32),
         "gripper_position": controller.gripper_position(),
+        "end_effector_transform": robot_state.end_effector_transform.astype(np.float32),
         "actions": action.astype(np.float32),
         "task": args.task,
     }
