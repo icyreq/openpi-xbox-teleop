@@ -20,9 +20,9 @@ uv run python examples/franka_realsense/record_teleop_lerobot.py \
   /home/nvidia/lixu_thor/openpi_bak/.venv/bin/python \
     scripts/train_pytorch.py \
     pi05_franka_realsense_droid_action_full_align_full_finetune \
-    --exp_name AAA_franka_droid_action_new_data \
-    --num_train_steps 1600 \
-    --save_interval 1600 \
+    --exp_name AAA_franka_droid_action_0609 \
+    --num_train_steps 1800 \
+    --save_interval 1800 \
     --overwrite
 推理代码：
 

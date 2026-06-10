@@ -808,6 +808,152 @@ def write_jsonl(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def remove_episode_artifacts(root: pathlib.Path, episode_index: int) -> list[pathlib.Path]:
+    # 删除某个 episode 可能已经写出的 parquet、mp4 和临时图片目录，避免半提交污染下次 append。
+    removed: list[pathlib.Path] = []
+    data_file = root / "data" / f"chunk-{episode_index // 1000:03d}" / f"episode_{episode_index:06d}.parquet"
+    if data_file.exists():
+        data_file.unlink()
+        removed.append(data_file)
+
+    for video_file in (root / "videos").glob(f"chunk-*/*/episode_{episode_index:06d}.mp4"):
+        video_file.unlink()
+        removed.append(video_file)
+
+    for image_dir in (root / "images").glob(f"*/episode_{episode_index:06d}"):
+        if image_dir.is_dir():
+            shutil.rmtree(image_dir)
+            removed.append(image_dir)
+
+    return removed
+
+
+def video_keys_from_info(info: dict[str, Any]) -> list[str]:
+    # 从 LeRobot schema 中读取视频键，避免把非视频字段当成需要检查的 mp4。
+    return [key for key, feature in info.get("features", {}).items() if feature.get("dtype") == "video"]
+
+
+def episode_data_path(root: pathlib.Path, info: dict[str, Any], episode_index: int) -> pathlib.Path:
+    # 按 meta 中的路径模板定位 episode parquet，保持和 LeRobot 文件布局一致。
+    chunks_size = int(info.get("chunks_size", 1000))
+    episode_chunk = episode_index // chunks_size
+    template = info.get("data_path", "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet")
+    return root / template.format(episode_chunk=episode_chunk, episode_index=episode_index)
+
+
+def episode_video_paths(root: pathlib.Path, info: dict[str, Any], episode_index: int) -> list[pathlib.Path]:
+    # 按 meta 中的视频路径模板列出最后一条 episode 应该具备的所有视频文件。
+    chunks_size = int(info.get("chunks_size", 1000))
+    episode_chunk = episode_index // chunks_size
+    template = info.get("video_path", "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4")
+    return [
+        root / template.format(episode_chunk=episode_chunk, episode_index=episode_index, video_key=video_key)
+        for video_key in video_keys_from_info(info)
+    ]
+
+
+def is_episode_registered(root: pathlib.Path, episode_index: int) -> bool:
+    # 保存异常时只需要判断当前 episode 是否已经进入 meta。
+    episodes_path = root / "meta" / "episodes.jsonl"
+    if not episodes_path.is_file():
+        return False
+    return any(int(row["episode_index"]) == episode_index for row in load_jsonl(episodes_path))
+
+
+def last_episode_missing_files(root: pathlib.Path, *, use_videos: bool) -> tuple[int, list[str]] | None:
+    # 只检查 meta 中最后一条 episode；中间数据不在采集脚本启动时做全局校准。
+    info_path = root / "meta" / "info.json"
+    episodes_path = root / "meta" / "episodes.jsonl"
+    if not info_path.is_file() or not episodes_path.is_file():
+        return None
+
+    info = load_json(info_path)
+    episodes = load_jsonl(episodes_path)
+    total_episodes = int(info["total_episodes"])
+    if total_episodes <= 0 or not episodes:
+        return None
+
+    last_episode = episodes[-1]
+    last_index = int(last_episode["episode_index"])
+    if last_index != total_episodes - 1:
+        raise RuntimeError(
+            f"最后一条 episode_index={last_index}, 但 total_episodes={total_episodes}。"
+            "为避免校准整个数据集，已拒绝继续 append。"
+        )
+
+    missing: list[str] = []
+    data_path = episode_data_path(root, info, last_index)
+    if not data_path.is_file():
+        missing.append(str(data_path.relative_to(root)))
+    if use_videos:
+        for video_path in episode_video_paths(root, info, last_index):
+            if not video_path.is_file():
+                missing.append(str(video_path.relative_to(root)))
+    return (last_index, missing) if missing else None
+
+
+def delete_last_episode_from_meta(root: pathlib.Path, *, use_videos: bool) -> tuple[int, int, list[pathlib.Path]]:
+    # 删除最后一条已登记 episode，并同步重写 info/episodes/episodes_stats 三份 meta。
+    info_path = root / "meta" / "info.json"
+    episodes_path = root / "meta" / "episodes.jsonl"
+    stats_path = root / "meta" / "episodes_stats.jsonl"
+
+    info = load_json(info_path)
+    episodes = load_jsonl(episodes_path)
+    episode_stats = load_jsonl(stats_path) if stats_path.is_file() else []
+    total_episodes = int(info["total_episodes"])
+    if total_episodes <= 0 or not episodes:
+        return -1, 0, []
+
+    last_episode = episodes[-1]
+    last_index = int(last_episode["episode_index"])
+    if last_index != total_episodes - 1:
+        raise RuntimeError(
+            f"最后一条 episode_index={last_index}, 但 total_episodes={total_episodes}。"
+            "为避免校准整个数据集，已拒绝删除。"
+        )
+
+    last_length = int(last_episode["length"])
+    removed = remove_episode_artifacts(root, last_index)
+    episodes = episodes[:-1]
+    episode_stats = [row for row in episode_stats if int(row["episode_index"]) != last_index]
+
+    info["total_episodes"] = total_episodes - 1
+    info["total_frames"] = max(0, int(info["total_frames"]) - last_length)
+    if use_videos:
+        info["total_videos"] = max(0, int(info.get("total_videos", 0)) - len(video_keys_from_info(info)))
+    info["total_chunks"] = max(1, (info["total_episodes"] + int(info["chunks_size"]) - 1) // int(info["chunks_size"]))
+    info["splits"] = {"train": f"0:{info['total_episodes']}"}
+
+    write_json(info_path, info)
+    write_jsonl(episodes_path, episodes)
+    write_jsonl(stats_path, episode_stats)
+    return last_index, last_length, removed
+
+
+def cleanup_dataset_tail_before_append(root: pathlib.Path, *, use_videos: bool) -> None:
+    # append 前只校准尾部：先清理未登记的当前尾部文件，再删除文件不全的最后一条已登记 episode。
+    info_path = root / "meta" / "info.json"
+    if not info_path.is_file():
+        return
+
+    info = load_json(info_path)
+    next_episode_index = int(info["total_episodes"])
+    removed = remove_episode_artifacts(root, next_episode_index)
+    if removed:
+        print(f"已清理未登记的尾部半提交 episode: index={next_episode_index}, 文件数={len(removed)}")
+
+    missing = last_episode_missing_files(root, use_videos=use_videos)
+    if missing is None:
+        return
+    last_index, missing_files = missing
+    deleted_index, deleted_frames, removed_files = delete_last_episode_from_meta(root, use_videos=use_videos)
+    print(
+        f"最后一条已登记 episode 文件不完整, 已删除: index={deleted_index}, "
+        f"frames={deleted_frames}, 删除文件数={len(removed_files)}, 缺失={missing_files}"
+    )
+
+
 def delete_last_saved_episode(dataset: LeRobotDataset) -> tuple[int, int]:
     root = pathlib.Path(dataset.root)
     info_path = root / "meta" / "info.json"
@@ -923,6 +1069,7 @@ def create_or_load_dataset(args: Args) -> LeRobotDataset:
                 print(f"检测到空的本地 LeRobot 数据集目录, 将重新创建: {root}")
                 shutil.rmtree(root)
             else:
+                cleanup_dataset_tail_before_append(root, use_videos=args.use_videos)
                 dataset = LeRobotDataset(args.repo_id, root=root)
                 validate_dataset_schema(dataset, args)
                 dataset.episode_buffer = dataset.create_episode_buffer()
@@ -1124,6 +1271,28 @@ def make_record_frame(
     }
 
 
+def save_episode_with_cleanup(dataset: LeRobotDataset) -> None:
+    # LeRobot 先写 parquet/mp4, 最后才写 meta；异常时必须清理当前 episode 的半提交文件。
+    root = pathlib.Path(dataset.root)
+    episode_index = int(dataset.episode_buffer["episode_index"])
+    try:
+        dataset.save_episode()
+    except Exception:
+        # 如果 meta 已登记当前 episode，说明失败发生在提交之后，此时保留文件并交给下次启动校验。
+        if is_episode_registered(root, episode_index):
+            with contextlib.suppress(Exception):
+                refresh_dataset_metadata(dataset)
+            print(f"保存异常发生在 meta 登记之后, 已保留 episode: index={episode_index}")
+            raise
+
+        removed = remove_episode_artifacts(root, episode_index)
+        with contextlib.suppress(Exception):
+            refresh_dataset_metadata(dataset)
+        if removed:
+            print(f"保存失败后已清理半提交 episode: index={episode_index}, 文件数={len(removed)}")
+        raise
+
+
 def main(args: Args) -> None:
     if args.list_cameras:
         list_realsense_cameras()
@@ -1165,7 +1334,7 @@ def main(args: Args) -> None:
             reason = "用户丢弃" if discard else f"帧数少于最小值 {args.min_episode_frames}"
             print(f"已丢弃当前未保存 episode。原因: {reason}, 帧数={active_frames}")
         else:
-            dataset.save_episode()
+            save_episode_with_cleanup(dataset)
             episodes_saved += 1
             print(
                 f"已保存 episode。帧数={active_frames} "
